@@ -10,10 +10,11 @@ if sys.platform.startswith("linux"):
     libcast_handle = ctypes.CDLL("./libcast.so", ctypes.RTLD_GLOBAL)._handle  # load the libcast.so shared library
     pyclariuscast = ctypes.cdll.LoadLibrary("./pyclariuscast.so")  # load the pyclariuscast.so shared library
 
-import pyclariuscast
+import pyclariuscast # type: ignore
 from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Slot
 
+# Constants for user functions
 CMD_FREEZE: Final = 1
 CMD_CAPTURE_IMAGE: Final = 2
 CMD_CAPTURE_CINE: Final = 3
@@ -24,18 +25,25 @@ CMD_GAIN_INC: Final = 7
 CMD_B_MODE: Final = 12
 CMD_CFI_MODE: Final = 14
 
+# Events and Qt constants
+FREEZE_EVENT: Final  = QtCore.QEvent.Type.User
+BUTTON_EVENT: Final  = QtCore.QEvent.Type(int(QtCore.QEvent.Type.User) + 1)
+IMAGE_EVENT: Final   = QtCore.QEvent.Type(int(QtCore.QEvent.Type.User) + 2)
+QT_BLACK: Final      = QtCore.Qt.GlobalColor.black
+QT_ARGB32: Final     = QtGui.QImage.Format.Format_ARGB32
+QT_GRAYSCALE8: Final = QtGui.QImage.Format.Format_Grayscale8
 
 # custom event for handling change in freeze state
 class FreezeEvent(QtCore.QEvent):
     def __init__(self, frozen):
-        super().__init__(QtCore.QEvent.User)
+        super().__init__(FREEZE_EVENT)
         self.frozen = frozen
 
 
 # custom event for handling button presses
 class ButtonEvent(QtCore.QEvent):
     def __init__(self, btn, clicks):
-        super().__init__(QtCore.QEvent.Type(QtCore.QEvent.User + 1))
+        super().__init__(BUTTON_EVENT)
         self.btn = btn
         self.clicks = clicks
 
@@ -43,7 +51,7 @@ class ButtonEvent(QtCore.QEvent):
 # custom event for handling new images
 class ImageEvent(QtCore.QEvent):
     def __init__(self):
-        super().__init__(QtCore.QEvent.Type(QtCore.QEvent.User + 2))
+        super().__init__(IMAGE_EVENT)
 
 
 # manages custom events posted from callbacks, then relays as signals to the main widget
@@ -57,11 +65,11 @@ class Signaller(QtCore.QObject):
         self.usimage = QtGui.QImage()
 
     def event(self, evt):
-        if evt.type() == QtCore.QEvent.User:
+        if evt.type() == FREEZE_EVENT:
             self.freeze.emit(evt.frozen)
-        elif evt.type() == QtCore.QEvent.Type(QtCore.QEvent.User + 1):
+        elif evt.type() == BUTTON_EVENT:
             self.button.emit(evt.btn, evt.clicks)
-        elif evt.type() == QtCore.QEvent.Type(QtCore.QEvent.User + 2):
+        elif evt.type() == IMAGE_EVENT:
             self.image.emit(self.usimage)
         return True
 
@@ -91,15 +99,36 @@ class ImageView(QtWidgets.QGraphicsView):
         w = evt.size().width()
         h = evt.size().height()
         self.cast.setOutputSize(w, h)
-        self.image = QtGui.QImage(w, h, QtGui.QImage.Format_ARGB32)
-        self.image.fill(QtCore.Qt.black)
+        self.image = QtGui.QImage(w, h, QtGui.QImage.Format.Format_ARGB32)
+        self.image.fill(QT_BLACK)
         self.setSceneRect(0, 0, w, h)
 
     # black background
     def drawBackground(self, painter, rect):
-        painter.fillRect(rect, QtCore.Qt.black)
+        painter.fillRect(rect, QT_BLACK)
 
     # draws the image
+    def drawForeground(self, painter, rect):
+        if not self.image.isNull():
+            painter.drawImage(rect, self.image)
+
+class StrainView(QtWidgets.QGraphicsView):
+    def __init__(self, cast):
+        super().__init__()
+        self.cast = cast
+        self.setScene(QtWidgets.QGraphicsScene())
+        self.image = QtGui.QImage()
+
+    def updateImage(self, img):
+        self.image = img
+        self.viewport().update()
+
+    def resizeEvent(self, evt):
+        super().resizeEvent(evt)
+
+    def drawBackground(self, painter, rect):
+        painter.fillRect(rect, QT_BLACK)
+
     def drawForeground(self, painter, rect):
         if not self.image.isNull():
             painter.drawImage(rect, self.image)
@@ -125,10 +154,10 @@ class MainWidget(QtWidgets.QMainWindow):
         conn = QtWidgets.QPushButton("Connect")
         self.run = QtWidgets.QPushButton("Run")
         quit = QtWidgets.QPushButton("Quit")
-        depthUp = QtWidgets.QPushButton("< Depth")
-        depthDown = QtWidgets.QPushButton("> Depth")
-        gainInc = QtWidgets.QPushButton("> Gain")
-        gainDec = QtWidgets.QPushButton("< Gain")
+        depthUp = QtWidgets.QPushButton("- Depth")
+        depthDown = QtWidgets.QPushButton("+ Depth")
+        gainInc = QtWidgets.QPushButton("+ Gain")
+        gainDec = QtWidgets.QPushButton("- Gain")
         captureImage = QtWidgets.QPushButton("Capture Image")
         captureCine = QtWidgets.QPushButton("Capture Movie")
         saveImage = QtWidgets.QPushButton("Save Local")
@@ -212,9 +241,12 @@ class MainWidget(QtWidgets.QMainWindow):
         cfiMode.clicked.connect(tryCfiMode)
 
         # add widgets to layout
+        display_layout = QtWidgets.QHBoxLayout()
         self.img = ImageView(cast)
+        display_layout.addWidget(self.img)
+        display_layout.addWidget(StrainView(cast))
         layout = QtWidgets.QVBoxLayout()
-        layout.addWidget(self.img)
+        layout.addLayout(display_layout)
 
         inplayout = QtWidgets.QHBoxLayout()
         layout.addLayout(inplayout)
@@ -300,9 +332,9 @@ class MainWidget(QtWidgets.QMainWindow):
 def newProcessedImage(image, width, height, sz, micronsPerPixel, timestamp, angle, imu):
     bpp = sz / (width * height)
     if bpp == 4:
-        img = QtGui.QImage(image, width, height, QtGui.QImage.Format_ARGB32)
+        img = QtGui.QImage(image, width, height, QT_ARGB32)
     else:
-        img = QtGui.QImage(image, width, height, QtGui.QImage.Format_Grayscale8)
+        img = QtGui.QImage(image, width, height, QT_GRAYSCALE8)
     # a deep copy is important here, as the memory from 'image' won't be valid after the event posting
     signaller.usimage = img.copy()
     evt = ImageEvent()
@@ -320,7 +352,9 @@ def newProcessedImage(image, width, height, sz, micronsPerPixel, timestamp, angl
 # @param jpg jpeg compression size if the data is in jpeg format
 # @param rf flag for if the image received is radiofrequency data
 # @param angle acquisition angle for volumetric data
-def newRawImage(image, lines, samples, bps, axial, lateral, timestamp, jpg, rf, angle):
+
+# In the app, we need to toggle "View RF" from the research menu to stream RF data to this function
+def newRawImage(image: bytes, lines: int, samples: int, bps: int, axial: float, lateral: float, timestamp: int, jpg_size: int, is_rf: int, angle: float):
     return
 
 
@@ -360,6 +394,7 @@ def buttonsFn(button, clicks):
 
 ## main function
 def main():
+    help(pyclariuscast)
     cast = pyclariuscast.Caster(newProcessedImage, newRawImage, newSpectrumImage, newImuData, freezeFn, buttonsFn)
     app = QtWidgets.QApplication(sys.argv)
     widget = MainWidget(cast)
