@@ -9,7 +9,7 @@ if sys.platform.startswith("linux"):
     libcast_handle = ctypes.CDLL("./libcast.so", ctypes.RTLD_GLOBAL)._handle  # load the libcast.so shared library
     pyclariuscast = ctypes.cdll.LoadLibrary("./pyclariuscast.so")  # load the pyclariuscast.so shared library
 
-import pyclariuscast
+import pyclariuscast #type: ignore
 from PIL import Image
 
 printStream = True

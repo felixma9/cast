@@ -3,14 +3,17 @@
 import ctypes
 import os.path
 import sys
+import numpy as np
 from pathlib import Path
 from typing import Final
+from collections import deque
 
 if sys.platform.startswith("linux"):
     libcast_handle = ctypes.CDLL("./libcast.so", ctypes.RTLD_GLOBAL)._handle  # load the libcast.so shared library
     pyclariuscast = ctypes.cdll.LoadLibrary("./pyclariuscast.so")  # load the pyclariuscast.so shared library
 
 import pyclariuscast # type: ignore
+from strain_processor import StrainProcessor
 from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Slot
 
@@ -32,6 +35,10 @@ IMAGE_EVENT: Final   = QtCore.QEvent.Type(int(QtCore.QEvent.Type.User) + 2)
 QT_BLACK: Final      = QtCore.Qt.GlobalColor.black
 QT_ARGB32: Final     = QtGui.QImage.Format.Format_ARGB32
 QT_GRAYSCALE8: Final = QtGui.QImage.Format.Format_Grayscale8
+
+# Use a queue to store the previous frame and the current frame, these are passed into the
+# strain processor, which has an internal buffer
+frame_queue = deque(maxlen=2)
 
 # custom event for handling change in freeze state
 class FreezeEvent(QtCore.QEvent):
@@ -132,7 +139,6 @@ class StrainView(QtWidgets.QGraphicsView):
     def drawForeground(self, painter, rect):
         if not self.image.isNull():
             painter.drawImage(rect, self.image)
-
 
 # main widget with controls and ui
 class MainWidget(QtWidgets.QMainWindow):
@@ -244,7 +250,8 @@ class MainWidget(QtWidgets.QMainWindow):
         display_layout = QtWidgets.QHBoxLayout()
         self.img = ImageView(cast)
         display_layout.addWidget(self.img)
-        display_layout.addWidget(StrainView(cast))
+        self.strain_view = StrainView(cast)
+        display_layout.addWidget(self.strain_view)
         layout = QtWidgets.QVBoxLayout()
         layout.addLayout(display_layout)
 
@@ -353,8 +360,27 @@ def newProcessedImage(image, width, height, sz, micronsPerPixel, timestamp, angl
 # @param rf flag for if the image received is radiofrequency data
 # @param angle acquisition angle for volumetric data
 
+strain_processor = StrainProcessor(n_lines=104, n_blocks=25, n_samples=400)
+
 # In the app, we need to toggle "View RF" from the research menu to stream RF data to this function
 def newRawImage(image: bytes, lines: int, samples: int, bps: int, axial: float, lateral: float, timestamp: int, jpg_size: int, is_rf: int, angle: float):
+
+    if is_rf != 1:
+        return
+
+    print(f"New RF image received: lines: {lines}, samples: {samples}, bps: {bps}, axial: {axial}, lateral: {lateral}, timestamp: {timestamp}, jpg_size: {jpg_size}, is_rf: {is_rf}, angle: {angle}")
+    # process for strain imaging
+    rf_frame = np.frombuffer(image, dtype=np.uint16)
+
+    # convert from 16bit Clarius data to what C++ expects, 8bits
+    rf_frame = (rf_frame >> 8).astype(np.uint8)
+
+    if rf_frame.size != lines * samples:
+        print(f"RF frame size mismatch: expected {lines * samples}, got {rf_frame.size}")
+        return
+    
+    frame_queue.append(rf_frame)
+
     return
 
 
@@ -380,6 +406,22 @@ def newImuData(imu):
 ## called when freeze state changes
 # @param frozen the freeze state
 def freezeFn(frozen):
+
+    # Add extra feature, on freeze, calculate and display the strain map
+    if frozen == True and len(frame_queue) == 2:
+        print("We have frozen, now processing strain for frozen frame...")
+        
+        prev_frame = frame_queue[0]
+        curr_frame = frame_queue[1]
+
+        _, _, _, _ = strain_processor.process_rf_frame(prev_frame)
+        axial_disp, strain, correlation, avg_ncc = strain_processor.process_rf_frame(curr_frame)
+
+
+        print(f"Strain processing complete. avg_ncc={avg_ncc:.4f}")
+    else:
+        print("Not processing, the frame queue is less than 2")
+
     evt = FreezeEvent(frozen)
     QtCore.QCoreApplication.postEvent(signaller, evt)
 
@@ -394,7 +436,6 @@ def buttonsFn(button, clicks):
 
 ## main function
 def main():
-    help(pyclariuscast)
     cast = pyclariuscast.Caster(newProcessedImage, newRawImage, newSpectrumImage, newImuData, freezeFn, buttonsFn)
     app = QtWidgets.QApplication(sys.argv)
     widget = MainWidget(cast)
