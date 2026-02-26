@@ -1,10 +1,13 @@
 #!/usr/bin/env python
 
 import ctypes
+import logging
 import os.path
 import sys
 from pathlib import Path
 from typing import Final
+
+import numpy as np
 
 if sys.platform.startswith("linux"):
     libcast_handle = ctypes.CDLL("./libcast.so", ctypes.RTLD_GLOBAL)._handle  # load the libcast.so shared library
@@ -46,15 +49,22 @@ class ImageEvent(QtCore.QEvent):
         super().__init__(QtCore.QEvent.Type(QtCore.QEvent.User + 2))
 
 
+class ProxyImageEvent(QtCore.QEvent):
+    def __init__(self):
+        super().__init__(QtCore.QEvent.Type(QtCore.QEvent.User + 3))
+
+
 # manages custom events posted from callbacks, then relays as signals to the main widget
 class Signaller(QtCore.QObject):
     freeze = QtCore.Signal(bool)
     button = QtCore.Signal(int, int)
     image = QtCore.Signal(QtGui.QImage)
+    proxyimage = QtCore.Signal(QtGui.QImage)
 
     def __init__(self):
         QtCore.QObject.__init__(self)
         self.usimage = QtGui.QImage()
+        self.proxy = QtGui.QImage()
 
     def event(self, evt):
         if evt.type() == QtCore.QEvent.User:
@@ -63,19 +73,23 @@ class Signaller(QtCore.QObject):
             self.button.emit(evt.btn, evt.clicks)
         elif evt.type() == QtCore.QEvent.Type(QtCore.QEvent.User + 2):
             self.image.emit(self.usimage)
+        elif evt.type() == QtCore.QEvent.Type(QtCore.QEvent.User + 3):
+            self.proxyimage.emit(self.proxy)
         return True
 
 
 # global required for the cast api callbacks
 signaller = Signaller()
+logger = logging.getLogger(__name__)
 
 
 # draws the ultrasound image
 class ImageView(QtWidgets.QGraphicsView):
-    def __init__(self, cast):
+    def __init__(self, cast=None):
         QtWidgets.QGraphicsView.__init__(self)
         self.cast = cast
         self.setScene(QtWidgets.QGraphicsScene())
+        self.image = QtGui.QImage()
 
     # set the new image and redraw
     def updateImage(self, img):
@@ -90,7 +104,8 @@ class ImageView(QtWidgets.QGraphicsView):
     def resizeEvent(self, evt):
         w = evt.size().width()
         h = evt.size().height()
-        self.cast.setOutputSize(w, h)
+        if self.cast is not None:
+            self.cast.setOutputSize(w, h)
         self.image = QtGui.QImage(w, h, QtGui.QImage.Format_ARGB32)
         self.image.fill(QtCore.Qt.black)
         self.setSceneRect(0, 0, w, h)
@@ -213,8 +228,27 @@ class MainWidget(QtWidgets.QMainWindow):
 
         # add widgets to layout
         self.img = ImageView(cast)
+        self.proxy_img = ImageView()
+        self.proxy_title = QtWidgets.QLabel("B/A Proxy")
+        self.proxy_title.setAlignment(QtCore.Qt.AlignCenter)
+
+        split = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        split.addWidget(self.img)
+
+        right = QtWidgets.QWidget()
+        right_layout = QtWidgets.QVBoxLayout()
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.addWidget(self.proxy_title)
+        right_layout.addWidget(self.proxy_img)
+        right.setLayout(right_layout)
+
+        split.addWidget(right)
+        split.setStretchFactor(0, 1)
+        split.setStretchFactor(1, 1)
+        split.setSizes([1, 1])
+
         layout = QtWidgets.QVBoxLayout()
-        layout.addWidget(self.img)
+        layout.addWidget(split)
 
         inplayout = QtWidgets.QHBoxLayout()
         layout.addLayout(inplayout)
@@ -250,6 +284,7 @@ class MainWidget(QtWidgets.QMainWindow):
         signaller.freeze.connect(self.freeze)
         signaller.button.connect(self.button)
         signaller.image.connect(self.image)
+        signaller.proxyimage.connect(self.proxyImage)
 
         # get home path
         path = os.path.expanduser("~/")
@@ -277,6 +312,10 @@ class MainWidget(QtWidgets.QMainWindow):
     @Slot(QtGui.QImage)
     def image(self, img):
         self.img.updateImage(img)
+
+    @Slot(QtGui.QImage)
+    def proxyImage(self, img):
+        self.proxy_img.updateImage(img)
 
     # handles shutdown
     @Slot()
@@ -321,7 +360,144 @@ def newProcessedImage(image, width, height, sz, micronsPerPixel, timestamp, angl
 # @param rf flag for if the image received is radiofrequency data
 # @param angle acquisition angle for volumetric data
 def newRawImage(image, lines, samples, bps, axial, lateral, timestamp, jpg, rf, angle):
-    return
+    if rf != 1:
+        return
+
+    if lines <= 0 or samples <= 0:
+        logger.warning("RF frame ignored: invalid dimensions lines=%s samples=%s", lines, samples)
+        return
+
+    expected_u16 = lines * samples * 2
+    expected_u8 = lines * samples
+
+    try:
+        payload_len = len(image)
+    except Exception:
+        logger.warning("RF frame ignored: cannot determine payload length")
+        return
+
+    try:
+        if payload_len == expected_u16:
+            raw = np.frombuffer(image, dtype="<u2")
+        elif payload_len == expected_u8:
+            raw = np.frombuffer(image, dtype=np.uint8)
+        else:
+            logger.warning(
+                "RF frame ignored: payload size mismatch actual=%s expected_u16=%s expected_u8=%s",
+                payload_len,
+                expected_u16,
+                expected_u8,
+            )
+            return
+    except Exception as exc:
+        logger.warning("RF frame ignored: payload parsing failed: %s", exc)
+        return
+
+    try:
+        rf_data = raw.reshape((lines, samples)).astype(np.float32, copy=False)
+    except Exception as exc:
+        logger.warning("RF frame ignored: reshape failed for (%s, %s): %s", lines, samples, exc)
+        return
+
+    if not np.isfinite(rf_data).all():
+        logger.warning("RF frame contains non-finite values; replacing with finite defaults")
+        rf_data = np.nan_to_num(rf_data, nan=0.0, posinf=0.0, neginf=0.0)
+
+    window = 64
+    stride = 64
+    eps = 1e-6
+    tiny_eps = 1e-12
+
+    starts = list(range(0, samples, stride))
+    if not starts:
+        logger.warning("RF frame ignored: no axial windows available")
+        return
+
+    coarse = np.zeros((lines, len(starts)), dtype=np.float32)
+
+    for line_idx in range(lines):
+        line = rf_data[line_idx]
+        for col_idx, start in enumerate(starts):
+            seg = line[start : start + window]
+            if seg.size < 2:
+                coarse[line_idx, col_idx] = 0.0
+                continue
+
+            seg = seg.astype(np.float32, copy=False)
+            seg = seg - np.mean(seg, dtype=np.float64)
+
+            power = np.abs(np.fft.rfft(seg)) ** 2
+            if power.size <= 1:
+                coarse[line_idx, col_idx] = 0.0
+                continue
+
+            power = power.astype(np.float32, copy=False)
+            last_bin = power.size - 1
+            search_end = min(max(2, seg.size // 8), last_bin)
+            if search_end < 1:
+                coarse[line_idx, col_idx] = 0.0
+                continue
+
+            search_band = power[1 : search_end + 1]
+            if search_band.size == 0 or not np.isfinite(search_band).any():
+                coarse[line_idx, col_idx] = 0.0
+                continue
+
+            k1 = int(np.argmax(search_band)) + 1
+            k2 = min(2 * k1, last_bin)
+
+            e1_lo = max(1, k1 - 1)
+            e1_hi = min(last_bin, k1 + 1)
+            e2_lo = max(1, k2 - 1)
+            e2_hi = min(last_bin, k2 + 1)
+
+            e1 = float(np.sum(power[e1_lo : e1_hi + 1], dtype=np.float64))
+            e2 = float(np.sum(power[e2_lo : e2_hi + 1], dtype=np.float64))
+            coarse[line_idx, col_idx] = e2 / (e1 + eps)
+
+    if not np.isfinite(coarse).all():
+        logger.warning("Proxy map contains non-finite values; replacing with finite defaults")
+        coarse = np.nan_to_num(coarse, nan=0.0, posinf=0.0, neginf=0.0)
+
+    expanded = np.repeat(coarse, stride, axis=1)
+    if expanded.shape[1] < samples:
+        pad = samples - expanded.shape[1]
+        expanded = np.pad(expanded, ((0, 0), (0, pad)), mode="edge")
+    elif expanded.shape[1] > samples:
+        expanded = expanded[:, :samples]
+
+    p5, p95 = np.percentile(expanded, [5, 95])
+    if not np.isfinite(p5) or not np.isfinite(p95):
+        logger.warning("Proxy scaling percentiles are non-finite; applying safe fallback")
+        p5, p95 = 0.0, 1.0
+
+    if p95 <= p5 + tiny_eps:
+        logger.warning("Proxy scaling collapsed (p5=%s p95=%s); applying safe fallback", p5, p95)
+        normalized = np.zeros_like(expanded, dtype=np.float32)
+    else:
+        normalized = (expanded - p5) / (p95 - p5)
+        normalized = np.clip(normalized, 0.0, 1.0)
+
+    if not np.isfinite(normalized).all():
+        logger.warning("Proxy normalized map contains non-finite values; replacing with finite defaults")
+        normalized = np.nan_to_num(normalized, nan=0.0, posinf=1.0, neginf=0.0)
+
+    n = normalized
+    r = np.clip(1.5 - np.abs(4.0 * n - 3.0), 0.0, 1.0)
+    g = np.clip(1.5 - np.abs(4.0 * n - 2.0), 0.0, 1.0)
+    b = np.clip(1.5 - np.abs(4.0 * n - 1.0), 0.0, 1.0)
+    rgb = np.stack((r, g, b), axis=-1)
+    rgb8 = (rgb * 255.0).astype(np.uint8)
+
+    try:
+        h, w = rgb8.shape[0], rgb8.shape[1]
+        qimg = QtGui.QImage(rgb8.data, w, h, 3 * w, QtGui.QImage.Format_RGB888)
+        signaller.proxy = qimg.copy()
+        evt = ProxyImageEvent()
+        QtCore.QCoreApplication.postEvent(signaller, evt)
+    except Exception as exc:
+        logger.warning("Proxy image update failed: %s", exc)
+        return
 
 
 ## called when a new spectrum image is streamed
