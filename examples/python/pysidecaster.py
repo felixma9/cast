@@ -6,6 +6,8 @@ import sys
 from pathlib import Path
 from typing import Final
 
+import numpy as np
+
 if sys.platform.startswith("linux"):
     libcast_handle = ctypes.CDLL("./libcast.so", ctypes.RTLD_GLOBAL)._handle  # load the libcast.so shared library
     pyclariuscast = ctypes.cdll.LoadLibrary("./pyclariuscast.so")  # load the pyclariuscast.so shared library
@@ -46,15 +48,23 @@ class ImageEvent(QtCore.QEvent):
         super().__init__(QtCore.QEvent.Type(QtCore.QEvent.User + 2))
 
 
+# custom event for handling new RF heatmap images
+class RawImageEvent(QtCore.QEvent):
+    def __init__(self):
+        super().__init__(QtCore.QEvent.Type(QtCore.QEvent.User + 3))
+
+
 # manages custom events posted from callbacks, then relays as signals to the main widget
 class Signaller(QtCore.QObject):
     freeze = QtCore.Signal(bool)
     button = QtCore.Signal(int, int)
     image = QtCore.Signal(QtGui.QImage)
+    rf_image = QtCore.Signal(QtGui.QImage)
 
     def __init__(self):
         QtCore.QObject.__init__(self)
         self.usimage = QtGui.QImage()
+        self.rf_qimage = QtGui.QImage()
 
     def event(self, evt):
         if evt.type() == QtCore.QEvent.User:
@@ -63,6 +73,8 @@ class Signaller(QtCore.QObject):
             self.button.emit(evt.btn, evt.clicks)
         elif evt.type() == QtCore.QEvent.Type(QtCore.QEvent.User + 2):
             self.image.emit(self.usimage)
+        elif evt.type() == QtCore.QEvent.Type(QtCore.QEvent.User + 3):
+            self.rf_image.emit(self.rf_qimage)
         return True
 
 
@@ -100,6 +112,34 @@ class ImageView(QtWidgets.QGraphicsView):
         painter.fillRect(rect, QtCore.Qt.black)
 
     # draws the image
+    def drawForeground(self, painter, rect):
+        if not self.image.isNull():
+            painter.drawImage(rect, self.image)
+
+
+# draws the B/A proxy heatmap (no cast scan-converter dependency)
+class HeatmapView(QtWidgets.QGraphicsView):
+    def __init__(self):
+        QtWidgets.QGraphicsView.__init__(self)
+        self.setScene(QtWidgets.QGraphicsScene())
+        self.image = QtGui.QImage()
+
+    # set the new heatmap image and redraw
+    def updateImage(self, img):
+        self.image = img
+        self.scene().invalidate()
+
+    # resize the scene to match widget
+    def resizeEvent(self, evt):
+        w = evt.size().width()
+        h = evt.size().height()
+        self.setSceneRect(0, 0, w, h)
+
+    # black background
+    def drawBackground(self, painter, rect):
+        painter.fillRect(rect, QtCore.Qt.black)
+
+    # draws the heatmap scaled to fill the view
     def drawForeground(self, painter, rect):
         if not self.image.isNull():
             painter.drawImage(rect, self.image)
@@ -213,8 +253,26 @@ class MainWidget(QtWidgets.QMainWindow):
 
         # add widgets to layout
         self.img = ImageView(cast)
+
+        # B/A Proxy right panel
+        self.heatmap = HeatmapView()
+        ba_label = QtWidgets.QLabel("B/A Proxy")
+        ba_label.setAlignment(QtCore.Qt.AlignCenter)
+        ba_panel = QtWidgets.QWidget()
+        ba_vlayout = QtWidgets.QVBoxLayout(ba_panel)
+        ba_vlayout.setContentsMargins(0, 0, 0, 0)
+        ba_vlayout.addWidget(ba_label)
+        ba_vlayout.addWidget(self.heatmap)
+
+        splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        splitter.addWidget(self.img)
+        splitter.addWidget(ba_panel)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 1)
+        splitter.setSizes([600, 600])
+
         layout = QtWidgets.QVBoxLayout()
-        layout.addWidget(self.img)
+        layout.addWidget(splitter)
 
         inplayout = QtWidgets.QHBoxLayout()
         layout.addLayout(inplayout)
@@ -250,6 +308,7 @@ class MainWidget(QtWidgets.QMainWindow):
         signaller.freeze.connect(self.freeze)
         signaller.button.connect(self.button)
         signaller.image.connect(self.image)
+        signaller.rf_image.connect(self.rfimage)
 
         # get home path
         path = os.path.expanduser("~/")
@@ -277,6 +336,11 @@ class MainWidget(QtWidgets.QMainWindow):
     @Slot(QtGui.QImage)
     def image(self, img):
         self.img.updateImage(img)
+
+    # handles new B/A proxy heatmap images
+    @Slot(QtGui.QImage)
+    def rfimage(self, img):
+        self.heatmap.updateImage(img)
 
     # handles shutdown
     @Slot()
@@ -321,7 +385,120 @@ def newProcessedImage(image, width, height, sz, micronsPerPixel, timestamp, angl
 # @param rf flag for if the image received is radiofrequency data
 # @param angle acquisition angle for volumetric data
 def newRawImage(image, lines, samples, bps, axial, lateral, timestamp, jpg, rf, angle):
-    return
+    if rf != 1:
+        return
+
+    if lines <= 0 or samples <= 0:
+        print(f"[BA Proxy] Warning: invalid dims lines={lines} samples={samples}")
+        return
+
+    data_len = len(image)
+    expected_u16 = lines * samples * 2
+    expected_u8 = lines * samples
+
+    if data_len == expected_u16:
+        arr = np.frombuffer(image, dtype='<u2').astype(np.float32)
+    elif data_len == expected_u8:
+        arr = np.frombuffer(image, dtype=np.uint8).astype(np.float32)
+    else:
+        print(f"[BA Proxy] Warning: unexpected byte length {data_len}, expected {expected_u8} (u8) or {expected_u16} (u16)")
+        return
+
+    try:
+        arr = arr.reshape(lines, samples)
+    except Exception as e:
+        print(f"[BA Proxy] Warning: reshape failed: {e}")
+        return
+
+    if not np.isfinite(arr).any():
+        print("[BA Proxy] Warning: no finite values in RF frame")
+        return
+
+    # B/A proxy parameters
+    win_len = 64
+    stride = 64
+    eps = 1e-6
+
+    num_windows = max(1, samples // stride)
+    coarse_map = np.zeros((lines, num_windows), dtype=np.float32)
+
+    for li in range(lines):
+        line = arr[li]
+        for wi in range(num_windows):
+            start = wi * stride
+            end = min(start + win_len, samples)
+            seg = line[start:end].copy()
+            if len(seg) < 4:
+                continue
+
+            seg -= seg.mean()
+
+            power = np.abs(np.fft.rfft(seg)) ** 2
+            last_bin = len(power) - 1
+
+            if last_bin < 2:
+                continue
+
+            # Find fundamental: strongest bin in [1 .. max(2, nfft//8)]
+            upper = min(max(2, len(seg) // 8), last_bin)
+            k1 = int(np.argmax(power[1:upper + 1])) + 1
+
+            k2 = min(2 * k1, last_bin)
+
+            def bin_energy(k):
+                lo = max(0, k - 1)
+                hi = min(last_bin, k + 1) + 1
+                return float(np.sum(power[lo:hi]))
+
+            E1 = bin_energy(k1)
+            E2 = bin_energy(k2)
+            coarse_map[li, wi] = E2 / (E1 + eps)
+
+    coarse_map = np.where(np.isfinite(coarse_map), coarse_map, 0.0)
+
+    # Transpose so rows=depth (num_windows), cols=lateral (lines) — matches B-mode orientation
+    coarse_map = coarse_map.T  # shape: (num_windows, lines)
+
+    map_rows, map_cols = coarse_map.shape  # num_windows, lines
+
+    # Upsample to display size via nearest-neighbor indexing
+    disp_h, disp_w = 240, 320
+    row_idx = np.clip((np.arange(disp_h) * map_rows / disp_h).astype(int), 0, map_rows - 1)
+    col_idx = np.clip((np.arange(disp_w) * map_cols / disp_w).astype(int), 0, map_cols - 1)
+    upsampled = coarse_map[np.ix_(row_idx, col_idx)]
+
+    # Percentile scaling
+    tiny_eps = 1e-9
+    p5 = float(np.percentile(upsampled, 5))
+    p95 = float(np.percentile(upsampled, 95))
+
+    if p95 <= p5 + tiny_eps:
+        print("[BA Proxy] Warning: collapsed percentile range, using zero fallback")
+        normalized = np.zeros_like(upsampled)
+    else:
+        normalized = np.clip((upsampled - p5) / (p95 - p5), 0.0, 1.0)
+
+    # Jet colormap via NumPy (no matplotlib)
+    t = normalized.astype(np.float32)
+    r = np.clip(1.5 - np.abs(4.0 * t - 3.0), 0.0, 1.0)
+    g = np.clip(1.5 - np.abs(4.0 * t - 2.0), 0.0, 1.0)
+    b = np.clip(1.5 - np.abs(4.0 * t - 1.0), 0.0, 1.0)
+
+    rgb = np.stack([
+        (r * 255).astype(np.uint8),
+        (g * 255).astype(np.uint8),
+        (b * 255).astype(np.uint8),
+    ], axis=2)
+    rgb = np.ascontiguousarray(rgb)
+
+    try:
+        qi = QtGui.QImage(rgb.data, disp_w, disp_h, disp_w * 3, QtGui.QImage.Format_RGB888)
+        # deep copy: rgb buffer must not be referenced after this function returns
+        signaller.rf_qimage = qi.copy()
+        evt = RawImageEvent()
+        QtCore.QCoreApplication.postEvent(signaller, evt)
+    except Exception as e:
+        print(f"[BA Proxy] Warning: image conversion/post failed: {e}")
 
 
 ## called when a new spectrum image is streamed
@@ -363,7 +540,7 @@ def main():
     cast = pyclariuscast.Caster(newProcessedImage, newRawImage, newSpectrumImage, newImuData, freezeFn, buttonsFn)
     app = QtWidgets.QApplication(sys.argv)
     widget = MainWidget(cast)
-    widget.resize(640, 480)
+    widget.resize(1280, 600)
     widget.show()
     sys.exit(app.exec())
 
