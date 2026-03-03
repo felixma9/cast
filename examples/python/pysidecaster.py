@@ -421,40 +421,45 @@ def newRawImage(image, lines, samples, bps, axial, lateral, timestamp, jpg, rf, 
 
     # count only full-length windows; partial trailing windows have poor FFT resolution
     num_windows = max(1, (samples - win_len) // stride + 1)
-    coarse_map = np.zeros((lines, num_windows), dtype=np.float32)
 
-    for li in range(lines):
-        line = arr[li]
-        for wi in range(num_windows):
-            start = wi * stride
-            end = min(start + win_len, samples)
-            seg = line[start:end].copy()
-            if len(seg) < 4:
-                continue
+    # --- Vectorized computation: no Python loops over lines or windows ---
 
-            seg -= seg.mean()
+    # Build start indices and extract all windows at once
+    # window_indices shape: (num_windows, win_len)
+    window_starts = np.arange(num_windows, dtype=np.int32) * stride
+    window_indices = window_starts[:, None] + np.arange(win_len, dtype=np.int32)[None, :]
 
-            power = np.abs(np.fft.rfft(seg)) ** 2
-            last_bin = len(power) - 1
+    # windows shape: (lines, num_windows, win_len)
+    windows = arr[:, window_indices]
 
-            if last_bin < 2:
-                continue
+    # Remove DC per window
+    windows = windows - windows.mean(axis=2, keepdims=True)
 
-            # Find fundamental: strongest bin in [1 .. max(2, nfft//8)]
-            upper = min(max(2, len(seg) // 8), last_bin)
-            k1 = int(np.argmax(power[1:upper + 1])) + 1
+    # Power spectra for all windows at once: shape (lines, num_windows, nfft_bins)
+    power = np.abs(np.fft.rfft(windows, axis=2)) ** 2
+    nfft_bins = win_len // 2 + 1  # 33 for win_len=64
+    last_bin = nfft_bins - 1      # 32
 
-            k2 = min(2 * k1, last_bin)
+    # Find fundamental bin k1: strongest bin in [1 .. upper], shape (lines, num_windows)
+    upper = min(max(2, win_len // 8), last_bin)  # 8 for win_len=64
+    k1 = np.argmax(power[:, :, 1:upper + 1], axis=2) + 1
 
-            def bin_energy(k):
-                lo = max(0, k - 1)
-                hi = min(last_bin, k + 1) + 1
-                return float(np.sum(power[lo:hi]))
+    # Second harmonic bin k2
+    k2 = np.minimum(2 * k1, last_bin)
 
-            E1 = bin_energy(k1)
-            E2 = bin_energy(k2)
-            coarse_map[li, wi] = E2 / (E1 + eps)
+    # 3-bin neighbourhood energy; k1 in [1,8] and k2 in [2,16] for these params — no boundary issue
+    L_idx = np.arange(lines)[:, None]        # (lines, 1)
+    W_idx = np.arange(num_windows)[None, :]  # (1, num_windows)
 
+    def gather_energy(kk):
+        kk_lo = np.clip(kk - 1, 0, last_bin)
+        kk_hi = np.clip(kk + 1, 0, last_bin)
+        return power[L_idx, W_idx, kk_lo] + power[L_idx, W_idx, kk] + power[L_idx, W_idx, kk_hi]
+
+    E1 = gather_energy(k1)
+    E2 = gather_energy(k2)
+
+    coarse_map = (E2 / (E1 + eps)).astype(np.float32)
     coarse_map = np.where(np.isfinite(coarse_map), coarse_map, 0.0)
 
     # Transpose so rows=depth (num_windows), cols=lateral (lines) — matches B-mode orientation
