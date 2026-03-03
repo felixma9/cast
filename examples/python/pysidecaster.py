@@ -416,10 +416,11 @@ def newRawImage(image, lines, samples, bps, axial, lateral, timestamp, jpg, rf, 
 
     # B/A proxy parameters
     win_len = 64
-    stride = 64
+    stride = 16
     eps = 1e-6
 
-    num_windows = max(1, samples // stride)
+    # count only full-length windows; partial trailing windows have poor FFT resolution
+    num_windows = max(1, (samples - win_len) // stride + 1)
     coarse_map = np.zeros((lines, num_windows), dtype=np.float32)
 
     for li in range(lines):
