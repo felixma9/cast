@@ -295,6 +295,89 @@ def test_dc_invariance():
     return passed
 
 
+def test_depth_gradient():
+    """
+    Simulates harmonic buildup with propagation depth.
+
+    Physical basis: as an ultrasound wave travels deeper into tissue, it
+    accumulates nonlinear distortion, progressively transferring energy from
+    the fundamental into the second harmonic.  Even in uniform tissue this
+    produces a systematic depth-dependent trend in E2/E1.
+
+    Signal construction:
+        signal[t] = A*cos(2*pi*f1*t) + h(t)*cos(2*pi*2*f1*t)
+        h(t) = H_MAX * t / (SAMPLES - 1)    -- zero at t=0, H_MAX at t=end
+
+    Expected per-window ratio for window wi (center at t_c = wi*stride + win_len/2):
+        h_eff(wi) = H_MAX * t_c / (SAMPLES - 1)
+        ratio(wi) ~ (h_eff(wi) / A)^2
+
+    Because h(t) varies within each 64-sample window (not constant), the FFT
+    sees a blend rather than a pure tone.  Tolerances are therefore looser
+    than for the stationary-signal tests.
+
+    Checks:
+        1. Strong positive correlation (r > 0.95) between window depth and ratio.
+        2. Shallow-end windows (first 10%) have ratio near zero.
+        3. Deep-end windows (last 10%) have ratio within 30% of (H_MAX/A)^2.
+    """
+    print("\n=== Test 6: Depth gradient -- harmonic buildup with depth ===")
+
+    LINES   = 8
+    SAMPLES = 1024
+    F_BIN   = 4
+    H_MAX   = 0.4   # harmonic amplitude at maximum depth; expected peak ratio = 0.16
+    A       = 1.0
+    STRIDE  = 16    # must match compute_ba_proxy
+
+    t          = np.arange(SAMPLES, dtype=np.float64)
+    f1         = F_BIN / WIN_LEN
+    h_envelope = H_MAX * t / (SAMPLES - 1)
+
+    signal = (A * np.cos(2.0 * np.pi * f1 * t)
+              + h_envelope * np.cos(2.0 * np.pi * 2.0 * f1 * t)).astype(np.float32)
+    arr = np.tile(signal, (LINES, 1))
+
+    coarse_map, k1, _, _ = compute_ba_proxy(arr)
+
+    num_windows = coarse_map.shape[1]
+
+    # Average over lines to get one ratio value per depth window
+    per_window = coarse_map.mean(axis=0)   # shape (num_windows,)
+
+    # Expected ratio at each window center
+    win_centers = np.array([wi * STRIDE + WIN_LEN // 2
+                             for wi in range(num_windows)], dtype=np.float64)
+    h_eff    = H_MAX * win_centers / (SAMPLES - 1)
+    expected = (h_eff / A) ** 2            # shape (num_windows,)
+
+    # Pearson correlation between window index and measured ratio
+    idx         = np.arange(num_windows, dtype=np.float64)
+    correlation = float(np.corrcoef(idx, per_window)[0, 1])
+
+    # Shallow-end mean (first 10% of windows)
+    n_tail       = max(1, num_windows // 10)
+    mean_shallow = float(per_window[:n_tail].mean())
+    mean_deep    = float(per_window[-n_tail:].mean())
+    expected_deep = float(expected[-n_tail:].mean())
+
+    # Print a depth profile sampled at ~10 evenly spaced windows
+    print(f"  {num_windows} depth windows  |  "
+          f"shallow mean={mean_shallow:.4f}  |  deep mean={mean_deep:.4f}  |  "
+          f"r={correlation:.4f}")
+    step = max(1, num_windows // 10)
+    print(f"  {'window':>7}  {'measured':>10}  {'expected':>10}")
+    for wi in range(0, num_windows, step):
+        print(f"  {wi:7d}  {per_window[wi]:10.5f}  {expected[wi]:10.5f}")
+
+    passed  = check_below("Pearson r > 0.95 (1/r check)",
+                          1.0 / correlation, 1.0 / 0.95)
+    passed &= check_below("shallow-end ratio near zero", mean_shallow, 5e-3)
+    passed &= check_near("deep-end ratio near expected",
+                         mean_deep, expected_deep, tol_pct=0.30)
+    return passed
+
+
 # ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
@@ -312,6 +395,7 @@ if __name__ == "__main__":
         "Test 3 -- Spatial differentiation": test_spatial_differentiation(),
         "Test 4 -- Amplitude invariance":    test_amplitude_invariance(),
         "Test 5 -- DC offset invariance":    test_dc_invariance(),
+        "Test 6 -- Depth gradient":          test_depth_gradient(),
     }
 
     print("\n" + "=" * 52)
